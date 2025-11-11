@@ -69,6 +69,7 @@ fn build_sasl(metadata: &Metadata) {
 
     let install_dir = metadata.out_dir.join("install");
 
+    println!("Running rust-sasl with autotools :-)");
     // Use autotools crate for configuration - it handles CC_<target> translation automatically
     let mut config = autotools::Config::new(&src_dir);
 
