@@ -67,13 +67,52 @@ fn build_sasl(metadata: &Metadata) {
 
     let install_dir = metadata.out_dir.join("install");
 
-    let mut cppflags = env::var("CPPFLAGS").ok().unwrap_or_else(String::new);
-    let mut cflags = env::var("CFLAGS").ok().unwrap_or_else(String::new);
+    // Use autotools crate for configuration - it handles CC_<target> translation automatically
+    let mut config = autotools::Config::new(&src_dir);
+
+    config
+        .enable_static()
+        .disable_shared()
+        .disable("sample", None)
+        .disable("checkapop", None)
+        .disable("cram", None)
+        .disable("scram", None)
+        .disable("digest", None)
+        .disable("otp", None)
+        .disable("anon", None)
+        .with("dblib", Some("none"))
+        .with("pic", None)
+        .insource(true); // Build in source since SASL doesn't support out-of-tree builds
+
+    if cfg!(feature = "gssapi-vendored") {
+        config.enable("gssapi", Some(&env::var("DEP_KRB5_SRC_ROOT").unwrap()));
+    } else {
+        config.disable("gssapi", None);
+    }
+
+    if cfg!(feature = "plain") {
+        config.enable("plain", None);
+    } else {
+        config.disable("plain", None);
+    }
+
+    if cfg!(feature = "scram") {
+        config.enable("scram", None);
+    } else {
+        config.disable("scram", None);
+    }
+
+    if metadata.target.contains("darwin") {
+        config.disable("macos-framework", None);
+    }
 
     // If OpenSSL has been vendored, point libsasl2 at the vendored headers.
     if cfg!(feature = "openssl-sys") {
         if let Ok(openssl_root) = env::var("DEP_OPENSSL_ROOT") {
-            cppflags += &format!(" -I{}", Path::new(&openssl_root).join("include").display());
+            config.cflag(format!(
+                "-I{}",
+                Path::new(&openssl_root).join("include").display()
+            ));
         }
     }
 
@@ -81,50 +120,12 @@ fn build_sasl(metadata: &Metadata) {
     // linking statically the sasl2 build system subverts libtool to almagamate
     // plugins into the main library archive, so we need to request PIC in
     // CFLAGS too.
-    cflags += " -fPIC";
+    config.cflag("-fPIC");
 
-    let mut configure_args = vec![
-        format!("--prefix={}", install_dir.display()),
-        "--enable-static".into(),
-        "--disable-shared".into(),
-        "--disable-sample".into(),
-        "--disable-checkapop".into(),
-        "--disable-cram".into(),
-        "--disable-scram".into(),
-        "--disable-digest".into(),
-        "--disable-otp".into(),
-        if cfg!(feature = "gssapi-vendored") {
-            format!("--enable-gssapi={}", env::var("DEP_KRB5_SRC_ROOT").unwrap())
-        } else {
-            "--disable-gssapi".into()
-        },
-        if cfg!(feature = "plain") {
-            "--enable-plain".into()
-        } else {
-            "--disable-plain".into()
-        },
-        if cfg!(feature = "scram") {
-            "--enable-scram".into()
-        } else {
-            "--disable-scram".into()
-        },
-        "--disable-anon".into(),
-        "--with-dblib=none".into(),
-        "--with-pic".into(),
-        format!("CPPFLAGS={}", cppflags),
-        format!("CFLAGS={}", cflags),
-    ];
-    if metadata.target.contains("darwin") {
-        configure_args.push("--disable-macos-framework".into());
-    }
-    if metadata.host != metadata.target {
-        configure_args.push(format!("--host={}", metadata.target));
-    }
-    cmd(src_dir.join("configure"), &configure_args)
-        .dir(&src_dir)
-        .env_remove("CONFIG_SITE")
-        .run()
-        .expect("configure failed");
+    config.config_option("prefix", Some(install_dir.to_str().unwrap()));
+
+    // Run configure only - this handles all the cross-compilation CC_<target> translation
+    let build_dir = config.configure();
 
     let is_bsd = metadata.host.contains("dragonflybsd")
         || metadata.host.contains("freebsd")
@@ -134,15 +135,12 @@ fn build_sasl(metadata: &Metadata) {
     let make = if is_bsd { "gmake" } else { "make" };
 
     let mut make_flags = OsString::new();
-    let mut make_args = vec![];
-    if let Ok(s) = env::var("NUM_JOBS") {
+    if env::var("NUM_JOBS").is_ok() {
         match env::var_os("CARGO_MAKEFLAGS") {
             // Only do this on non-Windows, since on Windows we could be
             // invoking mingw32-make which doesn't work with the jobserver.
             Some(s) if !cfg!(windows) => make_flags = s,
-
-            // Otherwise, let's hope it understands `-jN`.
-            _ => make_args.push(format!("-j{}", s)),
+            _ => {}
         }
     }
 
@@ -151,7 +149,7 @@ fn build_sasl(metadata: &Metadata) {
     // on targets in `include` and `common`, so build those directories first.
     for sub_dir in &["include", "common", "lib"] {
         cmd!(make, "install")
-            .dir(src_dir.join(sub_dir))
+            .dir(build_dir.join(sub_dir))
             .env("MAKEFLAGS", &make_flags)
             .run()
             .expect("make failed");
@@ -320,14 +318,12 @@ fn find_sasl(metadata: &Metadata) {
     }
 
     for prefix in &[Path::new("/usr"), Path::new("/usr/local")] {
-        for lib_dir in vec![
-            prefix.join("lib"),
+        for lib_dir in [prefix.join("lib"),
             prefix.join("lib64"),
             prefix.join("lib").join(&metadata.target),
             prefix
                 .join("lib")
-                .join(&metadata.target.replace("unknown-linux-gnu", "linux-gnu")),
-        ] {
+                .join(metadata.target.replace("unknown-linux-gnu", "linux-gnu"))] {
             let include_dir = prefix.join("include");
             if (lib_dir.join("libsasl2.a").exists()
                 || lib_dir.join("libsasl2.so").exists()
