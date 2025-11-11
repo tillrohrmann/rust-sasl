@@ -16,4 +16,8 @@
 use libc::{c_int, c_uint, c_ulong};
 use sasl2_sys::prelude::*;
 
+#[cfg(not(CROSS_COMPILING))]
 include!(concat!(env!("OUT_DIR"), "/all.rs"));
+
+#[cfg(CROSS_COMPILING)]
+fn main() {}

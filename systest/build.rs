@@ -17,9 +17,16 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    let cross_compiling = env::var("HOST").unwrap() != env::var("TARGET").unwrap();
+
     let mut cfg = ctest::TestGenerator::new();
     if let Ok(root) = env::var("DEP_SASL2_ROOT") {
         cfg.include(PathBuf::from(root).join("include"));
+    }
+
+    if cross_compiling {
+        println!("cargo:rustc-cfg=CROSS_COMPILING");
+        return;
     }
 
     cfg.header("sasl/prop.h")
