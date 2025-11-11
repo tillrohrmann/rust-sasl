@@ -35,6 +35,36 @@ struct Metadata {
     out_dir: PathBuf,
 }
 
+impl Metadata {
+    fn is_cross_compiling(&self) -> bool {
+        self.host != self.target
+    }
+
+    fn get_target_env(&self, name: &str) -> Option<String> {
+        if self.is_cross_compiling() {
+            env::var(format!("{}_{}", name, self.target.replace("-", "_"))).ok()
+        } else {
+            env::var(name).ok()
+        }
+    }
+}
+
+trait DuctExpressionExt: Sized {
+    fn set_target_env_vars(self, metadata: &Metadata) -> Self;
+}
+
+impl DuctExpressionExt for duct::Expression {
+    fn set_target_env_vars(mut self, metadata: &Metadata) -> Self {
+        if let Some(target_cc) = metadata.get_target_env("CC") {
+            self = self.env("CC", target_cc)
+        }
+        if let Some(target_ar) = metadata.get_target_env("AR") {
+            self = self.env("AR", target_ar)
+        }
+        self
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=SASL2_STATIC");
 
@@ -117,14 +147,21 @@ fn build_sasl(metadata: &Metadata) {
     if metadata.target.contains("darwin") {
         configure_args.push("--disable-macos-framework".into());
     }
-    if metadata.host != metadata.target {
+    if metadata.is_cross_compiling() {
         configure_args.push(format!("--host={}", metadata.target));
     }
-    cmd(src_dir.join("configure"), &configure_args)
+
+    let mut configure = cmd(src_dir.join("configure"), &configure_args)
         .dir(&src_dir)
         .env_remove("CONFIG_SITE")
-        .run()
-        .expect("configure failed");
+        .set_target_env_vars(metadata);
+
+    // When cross compiling we cannot run tests. Let's disable them in this case.
+    if metadata.is_cross_compiling() {
+        configure = configure.env("ac_cv_gssapi_supports_spnego", "yes");
+    }
+
+    configure.run().expect("configure failed");
 
     let is_bsd = metadata.host.contains("dragonflybsd")
         || metadata.host.contains("freebsd")
@@ -153,6 +190,7 @@ fn build_sasl(metadata: &Metadata) {
         cmd!(make, "install")
             .dir(src_dir.join(sub_dir))
             .env("MAKEFLAGS", &make_flags)
+            .set_target_env_vars(metadata)
             .run()
             .expect("make failed");
     }
@@ -320,13 +358,13 @@ fn find_sasl(metadata: &Metadata) {
     }
 
     for prefix in &[Path::new("/usr"), Path::new("/usr/local")] {
-        for lib_dir in vec![
+        for lib_dir in [
             prefix.join("lib"),
             prefix.join("lib64"),
             prefix.join("lib").join(&metadata.target),
             prefix
                 .join("lib")
-                .join(&metadata.target.replace("unknown-linux-gnu", "linux-gnu")),
+                .join(metadata.target.replace("unknown-linux-gnu", "linux-gnu")),
         ] {
             let include_dir = prefix.join("include");
             if (lib_dir.join("libsasl2.a").exists()
