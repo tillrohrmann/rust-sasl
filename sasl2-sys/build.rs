@@ -45,6 +45,8 @@ fn main() {
         out_dir: env::var("OUT_DIR").unwrap().into(),
     };
 
+    println!("Running rust-sasl with {metadata:?}");
+
     if cfg!(feature = "vendored") {
         build_sasl(&metadata)
     } else {
