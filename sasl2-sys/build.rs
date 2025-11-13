@@ -84,6 +84,11 @@ fn build_sasl(metadata: &Metadata) {
         .with("pic", None)
         .insource(true); // Build in source since SASL doesn't support out-of-tree builds
 
+    if metadata.host != metadata.target {
+        // When cross compiling we cannot run the tests. Let's disable them in this case.
+        config.env("ac_cv_gssapi_supports_spnego", "yes");
+    }
+
     if cfg!(feature = "gssapi-vendored") {
         config.enable("gssapi", Some(&env::var("DEP_KRB5_SRC_ROOT").unwrap()));
     } else {
@@ -318,12 +323,14 @@ fn find_sasl(metadata: &Metadata) {
     }
 
     for prefix in &[Path::new("/usr"), Path::new("/usr/local")] {
-        for lib_dir in [prefix.join("lib"),
+        for lib_dir in [
+            prefix.join("lib"),
             prefix.join("lib64"),
             prefix.join("lib").join(&metadata.target),
             prefix
                 .join("lib")
-                .join(metadata.target.replace("unknown-linux-gnu", "linux-gnu"))] {
+                .join(metadata.target.replace("unknown-linux-gnu", "linux-gnu")),
+        ] {
             let include_dir = prefix.join("include");
             if (lib_dir.join("libsasl2.a").exists()
                 || lib_dir.join("libsasl2.so").exists()
