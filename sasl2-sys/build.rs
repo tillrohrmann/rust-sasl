@@ -173,12 +173,15 @@ fn build_sasl(metadata: &Metadata) {
     let make = if is_bsd { "gmake" } else { "make" };
 
     let mut make_flags = OsString::new();
-    if let Ok(_) = env::var("NUM_JOBS") {
+    let mut make_args = vec![];
+    if let Ok(s) = env::var("NUM_JOBS") {
         match env::var_os("CARGO_MAKEFLAGS") {
             // Only do this on non-Windows, since on Windows we could be
             // invoking mingw32-make which doesn't work with the jobserver.
             Some(s) if !cfg!(windows) => make_flags = s,
-            _ => {}
+
+            // Otherwise, let's hope it understands `-jN`.
+            _ => make_args.push(format!("-j{}", s)),
         }
     }
 
