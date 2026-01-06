@@ -35,6 +35,38 @@ struct Metadata {
     out_dir: PathBuf,
 }
 
+impl Metadata {
+    fn is_cross_compiling(&self) -> bool {
+        self.host != self.target
+    }
+
+    fn get_target_env(&self, name: &str) -> Option<String> {
+        if self.is_cross_compiling() {
+            env::var(format!("{}_{}", name, self.target.replace("-", "_"))).ok()
+        } else {
+            env::var(name).ok()
+        }
+    }
+}
+
+#[cfg(unix)]
+trait DuctExpressionExt: Sized {
+    fn set_target_env_vars(self, metadata: &Metadata) -> Self;
+}
+
+#[cfg(unix)]
+impl DuctExpressionExt for duct::Expression {
+    fn set_target_env_vars(mut self, metadata: &Metadata) -> Self {
+        if let Some(target_cc) = metadata.get_target_env("CC") {
+            self = self.env("CC", target_cc)
+        }
+        if let Some(target_ar) = metadata.get_target_env("AR") {
+            self = self.env("AR", target_ar)
+        }
+        self
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=SASL2_STATIC");
 
@@ -67,57 +99,13 @@ fn build_sasl(metadata: &Metadata) {
 
     let install_dir = metadata.out_dir.join("install");
 
-    // Use autotools crate for configuration - it handles CC_<target> translation automatically
-    let mut config = autotools::Config::new(&src_dir);
-
-    config
-        .enable_static()
-        .disable_shared()
-        .disable("sample", None)
-        .disable("checkapop", None)
-        .disable("cram", None)
-        .disable("scram", None)
-        .disable("digest", None)
-        .disable("otp", None)
-        .disable("anon", None)
-        .with("dblib", Some("none"))
-        .with("pic", None)
-        .insource(true); // Build in source since SASL doesn't support out-of-tree builds
-
-    if metadata.host != metadata.target {
-        // When cross compiling we cannot run the tests. Let's disable them in this case.
-        config.env("ac_cv_gssapi_supports_spnego", "yes");
-    }
-
-    if cfg!(feature = "gssapi-vendored") {
-        config.enable("gssapi", Some(&env::var("DEP_KRB5_SRC_ROOT").unwrap()));
-    } else {
-        config.disable("gssapi", None);
-    }
-
-    if cfg!(feature = "plain") {
-        config.enable("plain", None);
-    } else {
-        config.disable("plain", None);
-    }
-
-    if cfg!(feature = "scram") {
-        config.enable("scram", None);
-    } else {
-        config.disable("scram", None);
-    }
-
-    if metadata.target.contains("darwin") {
-        config.disable("macos-framework", None);
-    }
+    let mut cppflags = env::var("CPPFLAGS").ok().unwrap_or_else(String::new);
+    let mut cflags = env::var("CFLAGS").ok().unwrap_or_else(String::new);
 
     // If OpenSSL has been vendored, point libsasl2 at the vendored headers.
     if cfg!(feature = "openssl-sys") {
         if let Ok(openssl_root) = env::var("DEP_OPENSSL_ROOT") {
-            config.cflag(format!(
-                "-I{}",
-                Path::new(&openssl_root).join("include").display()
-            ));
+            cppflags += &format!(" -I{}", Path::new(&openssl_root).join("include").display());
         }
     }
 
@@ -125,12 +113,57 @@ fn build_sasl(metadata: &Metadata) {
     // linking statically the sasl2 build system subverts libtool to almagamate
     // plugins into the main library archive, so we need to request PIC in
     // CFLAGS too.
-    config.cflag("-fPIC");
+    cflags += " -fPIC";
 
-    config.config_option("prefix", Some(install_dir.to_str().unwrap()));
+    let mut configure_args = vec![
+        format!("--prefix={}", install_dir.display()),
+        "--enable-static".into(),
+        "--disable-shared".into(),
+        "--disable-sample".into(),
+        "--disable-checkapop".into(),
+        "--disable-cram".into(),
+        "--disable-scram".into(),
+        "--disable-digest".into(),
+        "--disable-otp".into(),
+        if cfg!(feature = "gssapi-vendored") {
+            format!("--enable-gssapi={}", env::var("DEP_KRB5_SRC_ROOT").unwrap())
+        } else {
+            "--disable-gssapi".into()
+        },
+        if cfg!(feature = "plain") {
+            "--enable-plain".into()
+        } else {
+            "--disable-plain".into()
+        },
+        if cfg!(feature = "scram") {
+            "--enable-scram".into()
+        } else {
+            "--disable-scram".into()
+        },
+        "--disable-anon".into(),
+        "--with-dblib=none".into(),
+        "--with-pic".into(),
+        format!("CPPFLAGS={}", cppflags),
+        format!("CFLAGS={}", cflags),
+    ];
+    if metadata.target.contains("darwin") {
+        configure_args.push("--disable-macos-framework".into());
+    }
+    if metadata.is_cross_compiling() {
+        configure_args.push(format!("--host={}", metadata.target));
+    }
 
-    // Run configure only - this handles all the cross-compilation CC_<target> translation
-    let build_dir = config.configure();
+    let mut configure = cmd(src_dir.join("configure"), &configure_args)
+        .dir(&src_dir)
+        .env_remove("CONFIG_SITE")
+        .set_target_env_vars(metadata);
+
+    // When cross compiling we cannot run tests. Let's disable them in this case.
+    if metadata.is_cross_compiling() {
+        configure = configure.env("ac_cv_gssapi_supports_spnego", "yes");
+    }
+
+    configure.run().expect("configure failed");
 
     let is_bsd = metadata.host.contains("dragonflybsd")
         || metadata.host.contains("freebsd")
@@ -140,7 +173,7 @@ fn build_sasl(metadata: &Metadata) {
     let make = if is_bsd { "gmake" } else { "make" };
 
     let mut make_flags = OsString::new();
-    if env::var("NUM_JOBS").is_ok() {
+    if let Ok(_) = env::var("NUM_JOBS") {
         match env::var_os("CARGO_MAKEFLAGS") {
             // Only do this on non-Windows, since on Windows we could be
             // invoking mingw32-make which doesn't work with the jobserver.
@@ -154,8 +187,9 @@ fn build_sasl(metadata: &Metadata) {
     // on targets in `include` and `common`, so build those directories first.
     for sub_dir in &["include", "common", "lib"] {
         cmd!(make, "install")
-            .dir(build_dir.join(sub_dir))
+            .dir(src_dir.join(sub_dir))
             .env("MAKEFLAGS", &make_flags)
+            .set_target_env_vars(metadata)
             .run()
             .expect("make failed");
     }

@@ -26,7 +26,6 @@ openssl-sys = { version = "0.9.55", optional = true }
 version-sync = "0.9"
 
 [build-dependencies]
-autotools = "0.2"
 cc = "1.0.50"
 duct = "0.13.3"
 pkg-config = { version = "0.3.17", optional = true }
